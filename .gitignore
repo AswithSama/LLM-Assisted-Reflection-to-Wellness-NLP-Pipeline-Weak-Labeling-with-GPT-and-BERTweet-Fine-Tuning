@@ -229,11 +229,7 @@ vocab.txt
 bpe.codes
 special_tokens_map.json
 
-# Large data files
-data/raw/*
-data/processed/*
-!data/raw/.gitkeep
-!data/processed/.gitkeep
+
 
 # Logs
 *.log
