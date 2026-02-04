@@ -2,20 +2,23 @@
 
 from __future__ import annotations
 
+import os
 import re
+from pathlib import Path
+from typing import Iterable, Optional, Set, List, Tuple
+
 import emoji
 import pandas as pd
 import spacy
 from spacy.lang.en.stop_words import STOP_WORDS
 from transformers import AutoTokenizer
-from typing import Iterable, Optional, Set, List
 
 
 # ----------------------------
 # Emoji regex (keeps most Unicode emojis)
 # ----------------------------
 EMOJI_PATTERN = re.compile(
-    "[" 
+    "["
     u"\U0001F600-\U0001F64F"  # emoticons
     u"\U0001F300-\U0001F5FF"  # symbols & pictographs
     u"\U0001F680-\U0001F6FF"  # transport & map
@@ -24,7 +27,7 @@ EMOJI_PATTERN = re.compile(
     u"\U0001F900-\U0001F9FF"  # supplemental symbols
     u"\U00002600-\U000026FF"  # misc symbols
     "]+",
-    flags=re.UNICODE
+    flags=re.UNICODE,
 )
 
 
@@ -77,21 +80,6 @@ def is_emoji(token: str) -> bool:
     return bool(EMOJI_PATTERN.fullmatch(token))
 
 
-def normalize_punct(tok: str) -> Optional[str]:
-    """
-    Normalize emotional punctuation runs.
-    NOTE: In your notebook you kept only '!', '?', and '...'.
-    This helper is provided if you want to normalize runs like '!!!!!' -> '!'.
-    """
-    if set(tok) == {"!"}:
-        return "!"
-    if set(tok) == {"?"}:
-        return "?"
-    if set(tok) == {"."} and len(tok) >= 3:
-        return "..."
-    return None
-
-
 def in_bertweet(token: str, tokenizer: AutoTokenizer) -> bool:
     """
     Check if token is in BERTweet vocab (not [UNK]).
@@ -99,11 +87,7 @@ def in_bertweet(token: str, tokenizer: AutoTokenizer) -> bool:
     return tokenizer.convert_tokens_to_ids(token) != tokenizer.unk_token_id
 
 
-def preprocess_doc(
-    doc,
-    tokenizer: AutoTokenizer,
-    stop_words: Set[str],
-) -> List[str]:
+def preprocess_doc(doc, tokenizer: AutoTokenizer, stop_words: Set[str]) -> List[str]:
     """
     spaCy Doc -> list of cleaned tokens following your exact logic.
     """
@@ -117,7 +101,7 @@ def preprocess_doc(
 
         # EMOJIS (keep one per run)
         if is_emoji(t):
-            alias = emoji_to_text(t)   # 😂 -> ":face_with_tears_of_joy:"
+            alias = emoji_to_text(t)  # 😂 -> ":face_with_tears_of_joy:"
             if alias != last_emoji and in_bertweet(alias, tokenizer):
                 tokens.append(alias)
                 last_emoji = alias
@@ -215,7 +199,79 @@ def preprocess_dataframe(
         batch_size=batch_size,
     )
 
-    wellness_cols = df.drop(columns=drop_cols).columns
+    label_cols = [c for c in df.columns if c not in set(drop_cols + [output_col])]
     processed_df = pd.DataFrame({output_col: processed_texts}, index=df.index)
-    processed_df = pd.concat([processed_df, df[wellness_cols]], axis=1)
+    processed_df = pd.concat([processed_df, df[label_cols]], axis=1)
     return processed_df
+
+
+# ============================================================
+# Entry point 1: TEXT MODE (single string or list of strings)
+# ============================================================
+def preprocess_text(
+    text: str,
+    tokenizer_name: str = "vinai/bertweet-base",
+) -> str:
+    """
+    Raw single text -> processed single text (string).
+    Use this for inference (no disk writes).
+    """
+    out = preprocess_texts([text], tokenizer_name=tokenizer_name, batch_size=1)
+    return out[0] if out else ""
+
+
+# ============================================================
+# Entry point 2: DATASET MODE (CSV -> processed CSV/Parquet)
+# ============================================================
+def preprocess_dataset(
+    input_path: str | Path,
+    output_dir: str | Path,
+    text_col: str = "text",
+    output_col: str = "cleaned_text",
+    drop_cols: Optional[List[str]] = None,
+    tokenizer_name: str = "vinai/bertweet-base",
+    batch_size: int = 512,
+    out_format: str = "parquet",  # "parquet" or "csv"
+) -> Tuple[Path, pd.DataFrame]:
+    """
+    Reads a dataset file (csv/parquet), preprocesses, and saves the processed dataset
+    into output_dir (artifacts/data). Returns (saved_path, processed_df).
+
+    This is what training.py should consume.
+    """
+    input_path = Path(input_path)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Read
+    if input_path.suffix.lower() == ".csv":
+        df = pd.read_csv(input_path)
+    elif input_path.suffix.lower() in {".parquet", ".pq"}:
+        df = pd.read_parquet(input_path)
+    else:
+        raise ValueError(f"Unsupported input file type: {input_path.suffix} (use .csv or .parquet)")
+
+    processed_df = preprocess_dataframe(
+        df=df,
+        text_col=text_col,
+        output_col=output_col,
+        drop_cols=drop_cols,
+        tokenizer_name=tokenizer_name,
+        batch_size=batch_size,
+    )
+
+    # Save
+    out_format = out_format.lower().strip()
+    if out_format not in {"parquet", "csv"}:
+        raise ValueError("out_format must be 'parquet' or 'csv'")
+
+    out_name = f"processed_{input_path.stem}.{ 'parquet' if out_format == 'parquet' else 'csv' }"
+    saved_path = output_dir / out_name
+
+    if out_format == "parquet":
+        processed_df.to_parquet(saved_path, index=False)
+    else:
+        processed_df.to_csv(saved_path, index=False)
+
+    return saved_path, processed_df
+

@@ -1,9 +1,12 @@
 # src/training.py
 
 from __future__ import annotations
-
+import json
+from pathlib import Path
+import os
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Optional, Dict, Tuple
 
 import numpy as np
@@ -37,7 +40,7 @@ def normalize_tweet(t: str) -> str:
 
 class LabeledTextDataset(Dataset):
     """
-    Stores raw text + multi-label targets. Tokenization happens in collate.
+    Stores raw/processed text + multi-label targets. Tokenization happens in collate.
     """
     def __init__(self, df: pd.DataFrame, text_col: str, label_cols: List[str]):
         self.texts  = df[text_col].astype(str).tolist()
@@ -49,7 +52,7 @@ class LabeledTextDataset(Dataset):
     def __getitem__(self, i: int) -> Dict[str, torch.Tensor | str]:
         return {
             "text": normalize_tweet(self.texts[i]),
-            "labels": torch.from_numpy(self.labels[i])
+            "labels": torch.from_numpy(self.labels[i]),
         }
 
 
@@ -123,6 +126,24 @@ def compute_pos_weight(df: pd.DataFrame, label_cols: List[str], device: str) -> 
     return pos_weight
 
 
+def load_processed_dataframe(
+    data_path: str | Path,
+) -> pd.DataFrame:
+    """
+    Loads a processed dataset from CSV/Parquet.
+    """
+    data_path = Path(data_path)
+    if not data_path.exists():
+        raise FileNotFoundError(f"Processed data not found: {data_path}")
+
+    if data_path.suffix.lower() == ".csv":
+        return pd.read_csv(data_path)
+    if data_path.suffix.lower() in {".parquet", ".pq"}:
+        return pd.read_parquet(data_path)
+
+    raise ValueError(f"Unsupported processed data format: {data_path.suffix} (use .csv or .parquet)")
+
+
 def train_model(
     processed_df: pd.DataFrame,
     text_col: str = "cleaned_text",
@@ -138,9 +159,9 @@ def train_model(
     unfreeze_top_k: int = 3,
     num_workers: int = 0,
     seed: int = 42,
-) -> Tuple[nn.Module, AutoTokenizer, Dict[str, List[float]]]:
+) -> Tuple[nn.Module, AutoTokenizer, Dict[str, List[float]], List[str]]:
     """
-    Trains classifier from processed_df. Returns (model, tokenizer, history).
+    Trains classifier from processed_df. Returns (model, tokenizer, history, label_cols).
     """
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -178,7 +199,11 @@ def train_model(
         pin_memory=(device == "cuda"),
     )
 
-    model = BertweetClassifier(model_name=model_name, num_labels=len(label_cols), unfreeze_top_k=unfreeze_top_k).to(device)
+    model = BertweetClassifier(
+        model_name=model_name,
+        num_labels=len(label_cols),
+        unfreeze_top_k=unfreeze_top_k,
+    ).to(device)
 
     pos_weight = compute_pos_weight(processed_df, label_cols, device=device)
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
@@ -232,7 +257,6 @@ def train_model(
 
         val_loss = vloss / max(1, len(val_loader))
 
-        # scheduler step (correct usage)
         scheduler.step(val_loss)
 
         cur_lr = opt.param_groups[0]["lr"]
@@ -240,7 +264,6 @@ def train_model(
         history["val_loss"].append(val_loss)
         history["lr"].append(cur_lr)
 
-        # ---- Early stopping ----
         if val_loss < best_val - 1e-6:
             best_val = val_loss
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
@@ -253,4 +276,104 @@ def train_model(
 
         print(f"Epoch {epoch+1}/{epochs} - train: {train_loss:.4f} - val: {val_loss:.4f} - lr: {cur_lr:.2e}")
 
-    return model, tokenizer, history
+    return model, tokenizer, history, label_cols
+
+
+# ============================================================
+# CLI: training takes input from artifacts/data (CSV/Parquet)
+# ============================================================
+def _parse_args():
+    import argparse
+
+    p = argparse.ArgumentParser(description="Train BERTweet multilabel model from processed dataset.")
+    p.add_argument(
+        "--data",
+        default=os.environ.get("PROCESSED_DATA", ""),
+        help="Path to processed dataset (.csv/.parquet). If empty, tries to find one in DATA_DIR.",
+    )
+    p.add_argument(
+        "--data_dir",
+        default=os.environ.get("DATA_DIR", "artifacts/data"),
+        help="Directory where processed files are stored (artifacts/data).",
+    )
+    p.add_argument("--text_col", default="cleaned_text")
+    p.add_argument("--model_name", default=MODEL_NAME_DEFAULT)
+    p.add_argument("--max_len", type=int, default=128)
+    p.add_argument("--batch_size", type=int, default=16)
+    p.add_argument("--val_frac", type=float, default=0.2)
+    p.add_argument("--epochs", type=int, default=25)
+    p.add_argument("--lr", type=float, default=2e-5)
+    p.add_argument("--weight_decay", type=float, default=1e-4)
+    p.add_argument("--patience", type=int, default=5)
+    p.add_argument("--unfreeze_top_k", type=int, default=3)
+    p.add_argument("--num_workers", type=int, default=0)
+    p.add_argument("--seed", type=int, default=42)
+    return p.parse_args()
+
+
+def _pick_latest_processed_file(data_dir: Path) -> Path:
+    """
+    Picks the most recently modified processed_*.parquet/csv in artifacts/data.
+    """
+    candidates = list(data_dir.glob("processed_*.parquet")) + list(data_dir.glob("processed_*.csv"))
+    if not candidates:
+        raise FileNotFoundError(f"No processed_*.parquet/csv found in {data_dir}")
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0]
+
+
+def main():
+    args = _parse_args()
+
+    data_dir = Path(args.data_dir)
+    data_path = Path(args.data) if args.data else _pick_latest_processed_file(data_dir)
+
+    df = load_processed_dataframe(data_path)
+
+    model, tokenizer, history, label_cols = train_model(
+        processed_df=df,
+        text_col=args.text_col,
+        label_cols=None,  # infer from df
+        model_name=args.model_name,
+        max_len=args.max_len,
+        batch_size=args.batch_size,
+        val_frac=args.val_frac,
+        epochs=args.epochs,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        patience=args.patience,
+        unfreeze_top_k=args.unfreeze_top_k,
+        num_workers=args.num_workers,
+        seed=args.seed,
+    )
+
+    # NOTE: We only train here. Exporting weights/tokenizer/config should be done by scripts/export_hf_dir.py
+    # In Colab, you would run:
+    #   python src/training.py
+    #   python scripts/export_hf_dir.py
+    #   python scripts/build_joblib_bundle.py
+
+    print("\n✅ Training complete.")
+    print("Loaded processed data from:", data_path.resolve())
+    print("Num labels:", len(label_cols))
+
+
+    # --- inside main(), AFTER training finishes ---
+    ckpt_dir = Path(os.environ.get("CKPT_DIR", "artifacts/checkpoints"))
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_path = ckpt_dir / "best_model.pt"
+
+    payload = {
+        "state_dict": model.state_dict(),
+        "label_cols": label_cols,
+        "model_name": args.model_name,
+        "max_len": args.max_len,
+    }
+
+    torch.save(payload, ckpt_path)
+    print("✅ Saved checkpoint to:", ckpt_path.resolve())
+
+
+
+if __name__ == "__main__":
+    main()
